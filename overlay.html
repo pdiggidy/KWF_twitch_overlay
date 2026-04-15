@@ -35,8 +35,9 @@
   /* ── Wrapper — sits bottom-left, sized for OBS ── */
   #overlay {
     position: absolute;
-    top: 0;
+    top: 70px;  /* leave room above for the donation alert popup */
     left: 0;
+    overflow: visible;  /* allow alert to render outside this box */
     width: 380px;
     background: var(--card);
     border: 1.5px solid var(--stroke);
@@ -192,7 +193,8 @@
   /* ── Donation alert popup ── */
   #alert {
     position: absolute;
-    top: -70px;
+    bottom: 100%;       /* float above the overlay card */
+    margin-bottom: 8px; /* gap between alert and card */
     left: 0;
     width: 380px;
     background: var(--red);
@@ -284,17 +286,16 @@
 </head>
 <body>
 
-<!--&lt;!&ndash; Donation alert &ndash;&gt;-->
-<!--<div id="alert">-->
-<!--  <div class="alert-icon">💛</div>-->
-<!--  <div class="alert-text">-->
-<!--    <div class="alert-title" id="alert-title">New donation!</div>-->
-<!--    <div class="alert-sub" id="alert-sub">Thank you for donatingF</div>-->
-<!--  </div>-->
-<!--</div>-->
-
 <!-- Main overlay -->
 <div id="overlay">
+  <!-- Donation alert — slides in above the card from the left -->
+  <div id="alert">
+    <div class="alert-icon">💛</div>
+    <div class="alert-text">
+      <div class="alert-title" id="alert-title">New donation!</div>
+      <div class="alert-sub"  id="alert-sub">Thank you for donating!</div>
+    </div>
+  </div>
   <div class="top-section">
     <div class="top-left">
       <div class="header">
@@ -330,14 +331,35 @@
     ? 'http://localhost:8080'
     : window.location.origin;
 
-  let lastRaised = null;
+  let lastRaised  = null;
+  let lastAlertId = -1;
+  let alertTimer  = null;
+
+  function showAlert(name) {
+    const alertEl = document.getElementById('alert');
+    const titleEl = document.getElementById('alert-title');
+    const subEl   = document.getElementById('alert-sub');
+
+    titleEl.textContent = name + ' donated!';
+    subEl.textContent   = 'Thank you so much! \u{1F49B}';
+
+    if (alertTimer) { clearTimeout(alertTimer); alertTimer = null; }
+    alertEl.classList.remove('show');
+    void alertEl.offsetWidth;  // force reflow so re-trigger animates
+    alertEl.classList.add('show');
+
+    alertTimer = setTimeout(() => {
+      alertEl.classList.remove('show');
+      alertTimer = null;
+    }, 6000);
+  }
 
   function formatEuro(n) {
     return Math.round(n).toLocaleString('nl-NL');
   }
 
   function applyUpdate(data) {
-    const { raised, goal } = data;
+    const { raised, goal, alert } = data;
     const raisedEl = document.getElementById('raised');
     const goalEl   = document.getElementById('goal');
     const barEl    = document.getElementById('bar');
@@ -356,6 +378,12 @@
     goalEl.textContent   = '€' + formatEuro(goal);
     barEl.style.width    = pct.toFixed(1) + '%';
     pctEl.textContent    = pct.toFixed(1) + '%';
+
+    // Show donation alert when a new donor is detected
+    if (alert && alert.id !== lastAlertId) {
+      lastAlertId = alert.id;
+      showAlert(alert.name);
+    }
   }
 
   // Server-Sent Events: server pushes data the moment it changes.

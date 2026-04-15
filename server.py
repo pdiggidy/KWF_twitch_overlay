@@ -17,6 +17,7 @@ import queue
 import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -25,19 +26,24 @@ import requests
 from bs4 import BeautifulSoup
 
 # ── Config ────────────────────────────────────────────────────────────────────
-KWF_URL    = "TEMP"
-GOAL       = 1000        # € goal — update if you change it on KWF
-PORT       = 8080
-POLL_SEC   = 30        # how often to re-scrape (seconds)
-LOG_FILE   = Path(__file__).parent / "donations.csv"
-debug = False
+KWF_URL        = "https://acties.kwf.nl/fundraisers/philipnierop/link-charity-stream-2026"
+KWF_DONORS_URL = "https://acties.kwf.nl/customcode/profileDonations"
+KWF_HISTORY_ID = "83588"   # fundraiser history id (from page JS)
+KWF_EVENT_ID   = "10510"   # event id (from page JS)
+GOAL           = 1000      # € goal — update if you change it on KWF
+PORT           = 8080
+POLL_SEC       = 30        # how often to re-scrape (seconds)
+LOG_FILE       = Path(__file__).parent / "donations.csv"
+debug          = False
+alert_counter  = 0
 # ─────────────────────────────────────────────────────────────────────────────
 
 state = {
-    "raised":    0.0,
-    "goal":      GOAL,
+    "raised":       0.0,
+    "goal":         GOAL,
     "last_updated": "never",
-    "donors": [],         # list of {"name": str, "amount": float} — last 5
+    "donors":       [],    # list of {"name": str, "amount": float} — last 5
+    "alert":        None,  # {"name": str, "id": int} when new donor detected
 }
 state_lock = threading.Lock()
 
@@ -94,7 +100,7 @@ def parse_euro(text: str) -> float:
 
 def scrape():
     """Fetch KWF page and extract raised amount + recent donors."""
-    global debug
+    global debug, alert_counter
     try:
         resp = requests.get(KWF_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -123,21 +129,35 @@ def scrape():
         if "€" in goal and re.search(r"\d", goal):
             goal = parse_euro(goal)
 
-        # ── Recent donors ─────────────────────────────────────────────────────
+        # ── Recent donors via API ─────────────────────────────────────────────
+        # Donors are loaded via AJAX on the page, not in the initial HTML,
+        # so we hit the same API endpoint the page JS uses.
         donors = []
-        # Donor names often appear in a list section
-        donor_section = soup.find(string=re.compile("donateurs", re.I))
-        if donor_section:
-            parent = donor_section.find_parent()
-            if parent:
-                for item in parent.find_next_siblings()[:10]:
-                    name_tag = item.find(["strong", "span", "p", "h4", "h5"])
-                    if name_tag:
-                        name = name_tag.get_text(strip=True)
-                        if name and len(name) > 1:
-                            donors.append({"name": name, "amount": None})
-                    if len(donors) >= 5:
-                        break
+        try:
+            donor_resp = requests.post(
+                KWF_DONORS_URL,
+                data={
+                    "history_id": KWF_HISTORY_ID,
+                    "event_id":   KWF_EVENT_ID,
+                    "offset":     0,
+                    "limit":      5,
+                },
+                headers={
+                    **HEADERS,
+                    "Referer":          KWF_URL,
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                timeout=15,
+            )
+            donor_resp.raise_for_status()
+            donor_data = donor_resp.json()
+            for d in donor_data.get("donations", []):
+                name   = "Anonymous" if d.get("d_anonymous") == "Y" else d.get("name", "")
+                amount = float(d.get("d_amount_local") or d.get("d_amount") or 0)
+                if name:
+                    donors.append({"name": name, "amount": amount})
+        except Exception as e:
+            print(f"[scraper] donors fetch error: {e}")
 
     except Exception as e:
         print(f"[scraper] parse error: {e}")
@@ -145,6 +165,8 @@ def scrape():
 
     with state_lock:
         prev_raised = state["raised"]
+        old_top = state["donors"][0]["name"] if state["donors"] else None  # capture before overwrite
+
         state["raised"]       = raised
         if debug:
             state["raised"] = prev_raised + 1
@@ -152,6 +174,14 @@ def scrape():
         state["goal"]         = goal
         state["last_updated"] = time.strftime("%H:%M:%S")
         state["donors"]       = donors
+
+        # Alert detection: new top donor = a new donation came in
+        new_top = donors[0]["name"] if donors else None
+        if new_top and new_top != old_top:
+            alert_counter += 1
+            state["alert"] = {"name": new_top, "id": alert_counter}
+        else:
+            state["alert"] = None
 
     pct = (raised / goal * 100) if goal else 0
     print(f"[scraper] €{raised:.0f} / €{goal:.0f}  ({pct:.1f}%)  @ {state['last_updated']}")
@@ -162,6 +192,8 @@ def scrape():
     if effective_raised != prev_raised:
         log_row(effective_raised, goal)
         broadcast()
+        with state_lock:
+            state["alert"] = None  # clear so reconnecting clients don't see stale alert
 
 
 def scraper_loop():
@@ -254,6 +286,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             else:
                 self.send(404, "text/plain", "not found")
+
+        elif path == "/test-alert":
+            global alert_counter
+            qs   = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            name = qs.get("name", ["Anonymous"])[0]
+            with state_lock:
+                alert_counter += 1
+                state["alert"] = {"name": name, "id": alert_counter}
+            broadcast()
+            with state_lock:
+                state["alert"] = None  # clear so reconnecting clients don't see stale alert
+            self.send(200, "application/json", json.dumps({"ok": True, "name": name}))
 
         else:
             self.send(404, "text/plain", "not found")
