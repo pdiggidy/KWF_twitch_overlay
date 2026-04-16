@@ -165,7 +165,6 @@ def scrape():
 
     with state_lock:
         prev_raised = state["raised"]
-        old_top = state["donors"][0]["name"] if state["donors"] else None  # capture before overwrite
 
         state["raised"]       = raised
         if debug:
@@ -175,9 +174,11 @@ def scrape():
         state["last_updated"] = time.strftime("%H:%M:%S")
         state["donors"]       = donors
 
-        # Alert detection: new top donor = a new donation came in
+        # Alert whenever raised increases — use most recent donor (donors[0])
+        # as the name. Comparing names would miss repeat donors or same-poll
+        # double donations; raised increasing is the reliable signal.
         new_top = donors[0]["name"] if donors else None
-        if new_top and new_top != old_top:
+        if new_top and state["raised"] != prev_raised:
             alert_counter += 1
             state["alert"] = {"name": new_top, "id": alert_counter}
         else:
